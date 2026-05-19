@@ -1,1 +1,459 @@
+@dataclass
+class Route:
+    shipper_id: int
+    depot_idx: int
+    stops: list[int]
+    load_kg: float
 
+    def full_path(self) -> list[int]:
+        return [self.depot_idx] + self.stops + [self.depot_idx]
+
+def route_travel_time(path: list[int], time_matrix: np.ndarray) -> float:
+    if len(path) < 2:
+        return 0.0
+    travel = sum(float(time_matrix[path[i], path[i + 1]]) for i in range(len(path) - 1))
+    service = max(0, len(path) - 2) * SERVICE_TIME_MIN
+    return travel + service
+
+def nearest_neighbor_route(
+    depot_idx: int,
+    candidates: list[int],
+    order_weights: dict[int, float],
+    time_matrix: np.ndarray,
+) -> tuple[list[int], list[int], float]:
+    remaining = set(candidates)
+    route = []
+    load = 0.0
+    current = depot_idx
+
+    while remaining:
+        feasible = [
+            stop for stop in remaining
+            if load + order_weights[stop] <= SHIPPER_CAPACITY_KG
+        ]
+        if not feasible:
+            break
+
+        best = min(feasible, key=lambda stop: float(time_matrix[current, stop]))
+        trial_path = [depot_idx] + route + [best] + [depot_idx]
+        if route_travel_time(trial_path, time_matrix) > SHIPPER_MAX_TIME_MIN:
+            break
+
+        route.append(best)
+        remaining.remove(best)
+        load += order_weights[best]
+        current = best
+
+    return route, sorted(remaining), load
+
+def insertion_delta(
+    stops: list[int],
+    depot_idx: int,
+    new_stop: int,
+    pos: int,
+    time_matrix: np.ndarray,
+) -> float:
+    path  = [depot_idx] + stops + [depot_idx]
+    prev  = path[pos]
+    next_ = path[pos + 1]
+    return (
+        float(time_matrix[prev, new_stop])
+        + float(time_matrix[new_stop, next_])
+        - float(time_matrix[prev, next_])
+        + SERVICE_TIME_MIN
+    )
+
+def two_opt(stops: list[int], depot_idx: int, time_matrix: np.ndarray, max_no_improve: int = 100 ) -> list[int]:
+    if len(stops) < 4:
+        return stops
+
+    best = stops[:]
+    best_cost = route_travel_time([depot_idx] + best + [depot_idx], time_matrix)
+    improved = True
+    no_improve = 0
+    while no_improve < max_no_improve:
+        improved = False
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best)):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                cost = route_travel_time([depot_idx] + candidate + [depot_idx], time_matrix)
+                if cost + 1e-6 < best_cost:
+                    best = candidate
+                    best_cost = cost
+                    improved = True
+                    break
+            if improved:
+                break
+            
+        if improved: no_improve=0
+        else: break
+    return best
+
+def or_opt(
+    routes: list[Route],
+    time_matrix: np.ndarray,
+    order_weights: dict[int, float],
+    chain_lengths: tuple[int, ...] = (1, 2, 3),
+) -> list[Route]:
+    improved_global = True
+    iterations      = 0
+    max_iterations  = 50
+
+    while improved_global and iterations < max_iterations:
+        improved_global = False
+        iterations     += 1
+
+        for src_idx, src_route in enumerate(routes):
+            if not src_route.stops:
+                continue
+
+            for k in chain_lengths:
+                # Cần ít nhất 1 stop còn lại sau khi bứng chuỗi k
+                if len(src_route.stops) < k + 1:
+                    continue
+
+                for chain_start in range(len(src_route.stops) - k + 1):
+                    chain        = src_route.stops[chain_start : chain_start + k]
+                    chain_weight = sum(order_weights.get(s, 0.0) for s in chain)
+
+                    # Stops của tuyến nguồn sau khi bứng chuỗi ra
+                    new_src_stops = (
+                        src_route.stops[:chain_start]
+                        + src_route.stops[chain_start + k:]
+                    )
+                    old_src_time = route_travel_time(src_route.full_path(), time_matrix)
+                    new_src_time = route_travel_time(
+                        [src_route.depot_idx] + new_src_stops + [src_route.depot_idx],
+                        time_matrix,
+                    )
+                    saving = old_src_time - new_src_time  # Tiết kiệm khi bứng ra
+
+                    # Thử chèn chuỗi vào mọi tuyến (kể cả tuyến nguồn)
+                    for dst_idx, dst_route in enumerate(routes):
+                        if dst_route.load_kg + chain_weight > SHIPPER_CAPACITY_KG:
+                            continue
+
+                        for ins_pos in range(len(dst_route.stops) + 1):
+                            # Bỏ qua vị trí hiện tại trong cùng tuyến nguồn
+                            if dst_idx == src_idx:
+                                if chain_start <= ins_pos <= chain_start + k:
+                                    continue
+                                base_stops = new_src_stops
+                            else:
+                                base_stops = dst_route.stops
+
+                            new_dst_stops = (
+                                base_stops[:ins_pos] + chain + base_stops[ins_pos:]
+                            )
+                            new_dst_time = route_travel_time(
+                                [dst_route.depot_idx] + new_dst_stops + [dst_route.depot_idx],
+                                time_matrix,
+                            )
+
+                            if dst_idx == src_idx:
+                                insertion_cost = new_dst_time - new_src_time
+                            else:
+                                old_dst_time   = route_travel_time(dst_route.full_path(), time_matrix)
+                                insertion_cost = new_dst_time - old_dst_time
+
+                            net_gain = saving - insertion_cost
+
+                            # Áp dụng nếu có lợi và thỏa ràng buộc thời gian
+                            if net_gain > 1e-6 and new_dst_time <= SHIPPER_MAX_TIME_MIN:
+                                src_route.stops   = new_src_stops
+                                src_route.load_kg -= chain_weight
+
+                                if dst_idx == src_idx:
+                                    src_route.stops   = new_dst_stops
+                                    src_route.load_kg += chain_weight
+                                else:
+                                    dst_route.stops   = new_dst_stops
+                                    dst_route.load_kg += chain_weight
+
+                                improved_global = True
+                                break  # Restart sau mỗi di chuyển thành công
+
+                        if improved_global:
+                            break
+                    if improved_global:
+                        break
+                if improved_global:
+                    break
+            if improved_global:
+                break
+
+    return routes
+
+def cheapest_insertion(
+    unassigned: set[int],
+    routes: list[Route],
+    order_weights: dict[int, float],
+    time_matrix: np.ndarray,
+) -> set[int]:
+    still_unassigned: set[int] = set()
+
+    for stop in sorted(unassigned):  # sorted để kết quả deterministic
+        weight    = order_weights.get(stop, 0.0)
+        best_move: tuple[float, int, int] | None = None
+        # best_move = (delta_nhỏ_nhất, route_idx, pos)
+
+        for r_idx, route in enumerate(routes):
+            # Kiểm tra tải trọng trước — bỏ qua sớm nếu không đủ chỗ
+            if route.load_kg + weight > SHIPPER_CAPACITY_KG:
+                continue
+
+            current_time = route_travel_time(route.full_path(), time_matrix)
+
+            for pos in range(len(route.stops) + 1):
+                delta    = insertion_delta(route.stops, route.depot_idx, stop, pos, time_matrix)
+                new_time = current_time + delta
+
+                if new_time > SHIPPER_MAX_TIME_MIN:
+                    continue
+
+                if best_move is None or delta < best_move[0]:
+                    best_move = (delta, r_idx, pos)
+
+        if best_move is not None:
+            _, r_idx, pos = best_move
+            routes[r_idx].stops.insert(pos, stop)
+            routes[r_idx].load_kg += weight
+        else:
+            still_unassigned.add(stop)
+
+    return still_unassigned
+
+def part4_vrp_optimization(G: nx.MultiDiGraph | None = None) -> dict[str, Any]:
+    print("\n" + "=" * 70)
+    print("PART 4 — VRP OPTIMIZATION")
+    print("=" * 70)
+
+    delivery_data = load_json(OUTPUT_DIR / "delivery_nodes.json")
+    zone_data = load_json(OUTPUT_DIR / "zone_assignments.json")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    dist_matrix = np.load(OUTPUT_DIR / "dist_matrix.npy")
+
+    deliveries = delivery_data["deliveries"]
+    depots = delivery_data["depots"]
+
+    order_weights = {
+        order_idx_to_matrix_index(i): float(deliveries[i]["weight_kg"])
+        for i in range(len(deliveries))
+    }
+
+    unassigned = set(order_idx_to_matrix_index(i) for i in range(len(deliveries)))
+    routes: list[Route] = []
+
+    for zone_id_str, zone in sorted(zone_data.items(), key=lambda item: int(item[0])):
+        zone_id = int(zone_id_str)
+        depot_name = zone["nearest_depot"]
+        depot_idx = next(
+            int(d["matrix_index"]) for d in depots if d["name"] == depot_name
+        )
+        candidates = [
+            order_idx_to_matrix_index(i)
+            for i in zone["delivery_indices"]
+            if order_idx_to_matrix_index(i) in unassigned
+        ]
+
+        stops, leftover, load = nearest_neighbor_route(
+            depot_idx,
+            candidates,
+            order_weights,
+            time_matrix,
+        )
+        stops = two_opt(stops, depot_idx, time_matrix)
+        for stop in stops:
+            unassigned.discard(stop)
+
+        routes.append(Route(zone_id, depot_idx, stops, load))
+        
+    print("\n[Or-opt] Cân bằng tải liên tuyến (chain 1-2-3)...")
+    t_or = time.time()
+    routes = or_opt(routes, time_matrix, order_weights)
+    print(f"  Hoàn tất trong {time.time() - t_or:.1f}s")
+
+
+    # Try to insert unassigned orders into the cheapest feasible route.
+    if unassigned:
+        print(f"\n[Insertion] {len(unassigned)} đơn hàng chưa giao, đang chèn...")
+        unassigned = cheapest_insertion(unassigned, routes, order_weights, time_matrix)
+        print(f"  Còn sót {len(unassigned)} đơn sau insertion")
+
+    schedule = []
+    for offset, route in enumerate(sorted(routes, key=lambda r: len(r.stops), reverse=True)):
+        path = route.full_path()
+        travel_time = route_travel_time(path, time_matrix)
+        travel_dist = sum(float(dist_matrix[path[i], path[i + 1]]) for i in range(len(path) - 1))
+        schedule.append(
+            {
+                "shipper_id": route.shipper_id,
+                "depot_idx": route.depot_idx,
+                "depot_name": depots[route.depot_idx]["name"],
+                "departure": f"{WORKING_START_HOUR:02d}:{offset * 5:02d}",
+                "n_stops": len(route.stops),
+                "load_kg": round(route.load_kg, 1),
+                "total_time_min": round(travel_time, 1),
+                "total_distance_km": round(travel_dist, 2),
+                "feasible": route.load_kg <= SHIPPER_CAPACITY_KG and travel_time <= SHIPPER_MAX_TIME_MIN,
+                "route_stops": path,
+                "order_ids": [
+                    deliveries[matrix_index_to_order_idx(stop)]["order_id"]
+                    for stop in route.stops
+                ],
+            }
+        )
+
+    solution = {
+        "metadata": {
+            "algorithm": "Zone assignment + nearest neighbor + 2-opt + cheapest insertion",
+            "n_depots": N_DEPOTS,
+            "n_shippers": len(routes),
+            "n_orders": len(deliveries),
+            "assigned_orders": len(deliveries) - len(unassigned),
+            "unassigned_orders": len(unassigned),
+            "total_time_min": round(sum(s["total_time_min"] for s in schedule), 1),
+            "total_distance_km": round(sum(s["total_distance_km"] for s in schedule), 2),
+            "shipper_capacity_kg": SHIPPER_CAPACITY_KG,
+            "shipper_max_time_min": SHIPPER_MAX_TIME_MIN,
+        },
+        "schedule": schedule,
+        "unassigned_orders": [
+            {
+                "order_index": matrix_index_to_order_idx(stop),
+                "order_id": deliveries[matrix_index_to_order_idx(stop)]["order_id"],
+            }
+            for stop in sorted(unassigned)
+        ],
+    }
+    save_json(OUTPUT_DIR / "vrp_solution.json", solution)
+    if G is not None:
+        visualize_part4_vrp_routes(G, solution, delivery_data)
+    print(
+        f"Assigned {solution['metadata']['assigned_orders']}/{len(deliveries)} orders | "
+        f"unassigned={len(unassigned)}"
+    )
+    return solution
+
+
+def matrix_route_to_graph_route(G: nx.MultiDiGraph, matrix_route: list[int]) -> list[str]:
+    """Convert a depot/order matrix route into a continuous graph-node route."""
+    graph_route: list[str] = []
+    for src_idx, dst_idx in zip(matrix_route[:-1], matrix_route[1:]):
+        src = graph_node_from_matrix_index(src_idx)
+        dst = graph_node_from_matrix_index(dst_idx)
+        segment = shortest_node_route(G, src, dst)
+        if not segment:
+            continue
+        if graph_route:
+            segment = segment[1:]
+        graph_route.extend(segment)
+    return graph_route
+
+def visualize_part4_vrp_routes(
+    G: nx.MultiDiGraph,
+    solution: dict[str, Any],
+    delivery_data: dict[str, Any],
+) -> None:
+    """Visualize final optimized VRP routes as static and interactive maps."""
+    print("\n[VIS] Part 4 VRP routes...")
+
+    depots = delivery_data["depots"]
+    deliveries = delivery_data["deliveries"]
+    route_paths = []
+    for route in solution["schedule"]:
+        graph_route = matrix_route_to_graph_route(G, route["route_stops"])
+        latlon = route_latlon_path(G, graph_route) if graph_route else []
+        route_paths.append((route, graph_route, latlon))
+
+    fig, ax = plt.subplots(figsize=(15, 15), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(
+        ax,
+        G,
+        "Part 4 - Optimized VRP Routes on Part 1 Map",
+    )
+
+    for route, _, latlon in route_paths:
+        color = MAP_COLORS[int(route["shipper_id"]) % len(MAP_COLORS)]
+        if len(latlon) >= 2:
+            lats = [p[0] for p in latlon]
+            lons = [p[1] for p in latlon]
+            ax.plot(lons, lats, color=color, linewidth=2.0, alpha=0.82, zorder=25)
+
+        stop_orders = [idx for idx in route["route_stops"][1:-1] if idx >= N_DEPOTS]
+        ax.scatter(
+            [deliveries[matrix_index_to_order_idx(idx)]["lon"] for idx in stop_orders],
+            [deliveries[matrix_index_to_order_idx(idx)]["lat"] for idx in stop_orders],
+            s=26,
+            color=color,
+            edgecolor="white",
+            linewidth=0.35,
+            zorder=30,
+        )
+
+    for depot in depots:
+        ax.scatter(depot["lon"], depot["lat"], s=160, marker="s", color="#111827", edgecolor="white", zorder=40)
+        ax.text(depot["lon"], depot["lat"], depot["name"], fontsize=8, color="#111827", fontweight="bold", zorder=41)
+
+    out_path = OUTPUT_DIR / "part4_vrp_routes.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map: {out_path}")
+
+    fmap = make_base_folium_map(G, "Part 4 - Optimized VRP Routes")
+    if fmap is not None:
+        for route, _, latlon in route_paths:
+            shipper_id = int(route["shipper_id"])
+            color = MAP_COLORS[shipper_id % len(MAP_COLORS)]
+            group = folium.FeatureGroup(
+                name=f"Shipper {shipper_id}: {route['n_stops']} stops, {route['total_time_min']} min",
+                show=True,
+            )
+            if len(latlon) >= 2:
+                folium.PolyLine(
+                    latlon,
+                    color=color,
+                    weight=4,
+                    opacity=0.82,
+                    tooltip=(
+                        f"Shipper {shipper_id} | {route['n_stops']} stops | "
+                        f"{route['total_time_min']} min | {route['total_distance_km']} km"
+                    ),
+                ).add_to(group)
+
+            depot = depots[int(route["depot_idx"])]
+            folium.Marker(
+                [depot["lat"], depot["lon"]],
+                tooltip=f"Start/End: {depot['name']}",
+                icon=folium.Icon(color="red", icon="home"),
+            ).add_to(group)
+
+            for seq, matrix_idx in enumerate(route["route_stops"][1:-1], start=1):
+                if matrix_idx < N_DEPOTS:
+                    continue
+                order = deliveries[matrix_index_to_order_idx(matrix_idx)]
+                folium.CircleMarker(
+                    [order["lat"], order["lon"]],
+                    radius=4,
+                    color=color,
+                    fill=True,
+                    fill_opacity=0.88,
+                    tooltip=f"#{seq} {order['order_id']} | {order['weight_kg']}kg | S{shipper_id}",
+                ).add_to(group)
+            group.add_to(fmap)
+
+        unassigned_group = folium.FeatureGroup(name="Unassigned orders", show=True)
+        for item in solution["unassigned_orders"]:
+            order = deliveries[int(item["order_index"])]
+            folium.CircleMarker(
+                [order["lat"], order["lon"]],
+                radius=5,
+                color="#111827",
+                fill=True,
+                fill_color="#ef4444",
+                fill_opacity=0.95,
+                tooltip=f"Unassigned: {order['order_id']}",
+            ).add_to(unassigned_group)
+        unassigned_group.add_to(fmap)
+
+    save_folium_map(fmap, "part4_vrp_routes.html")
